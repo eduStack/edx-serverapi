@@ -14,14 +14,16 @@ from django.test.client import Client
 from django.test.utils import override_settings
 from django.utils.translation import ugettext as _
 from django.core.cache import cache
+from student.models import UserProfile
 from student.tests.factories import UserFactory
 
 TEST_API_KEY = str(uuid.uuid4())
 
 
 @override_settings(EDX_API_KEY=TEST_API_KEY)
-@patch.dict("django.conf.settings.FEATURES", {'ENFORCE_PASSWORD_POLICY': True})
-@patch.dict("django.conf.settings.FEATURES", {'ENABLE_MAX_FAILED_LOGIN_ATTEMPTS': True})
+@patch.dict("django.conf.settings.FEATURES", {'ENFORCE_PASSWORD_POLICY': True,
+                                              'ENABLE_MAX_FAILED_LOGIN_ATTEMPTS': True,
+                                              'PREVENT_CONCURRENT_LOGINS': False})
 class SessionApiSecurityTest(TestCase):
     """
     Test api_manager.session.session_list view
@@ -34,12 +36,15 @@ class SessionApiSecurityTest(TestCase):
         self.user = UserFactory.build(username='test', email='test@edx.org')
         self.user.set_password('test_password')
         self.user.save()
+        profile = UserProfile(user=self.user)
+        profile.city = 'Boston'
+        profile.save()
 
         # Create the test client
         self.client = Client()
         cache.clear()
-        self.session_url = '/api/sessions'
-        self.user_url = '/api/users'
+        self.session_url = '/api/server/sessions'
+        self.user_url = '/api/server/users'
 
     @override_settings(MAX_FAILED_LOGIN_ATTEMPTS_ALLOWED=10)
     def test_login_ratelimited_success(self):

@@ -16,12 +16,14 @@ from django.test.utils import override_settings
 from django.utils.translation import ugettext as _
 from django.core.cache import cache
 from student.tests.factories import UserFactory
+from student.models import UserProfile
 
 TEST_API_KEY = str(uuid.uuid4())
 
 
 @override_settings(EDX_API_KEY=TEST_API_KEY)
-@patch.dict("django.conf.settings.FEATURES", {'ENABLE_MAX_FAILED_LOGIN_ATTEMPTS': False})
+@patch.dict("django.conf.settings.FEATURES", {'ENABLE_MAX_FAILED_LOGIN_ATTEMPTS': False,
+                                              'PREVENT_CONCURRENT_LOGINS': False})
 class SessionApiRateLimitingProtectionTest(TestCase):
     """
     Test api_manager.session.login.ratelimit
@@ -33,11 +35,14 @@ class SessionApiRateLimitingProtectionTest(TestCase):
         self.user = UserFactory.build(username='test', email='test@edx.org')
         self.user.set_password('test_password')
         self.user.save()
+        profile = UserProfile(user=self.user)
+        profile.city = 'Boston'
+        profile.save()
 
         # Create the test client
         self.client = Client()
         cache.clear()
-        self.session_url = '/api/sessions'
+        self.session_url = '/api/server/sessions'
 
     def test_login_ratelimiting_protection(self):
         """ Try (and fail) login user 30 times on invalid password """

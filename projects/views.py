@@ -34,7 +34,7 @@ from .serializers import ProjectSerializer, WorkgroupSerializer, WorkgroupSubmis
 from .serializers import WorkgroupReviewSerializer, WorkgroupSubmissionReviewSerializer, WorkgroupPeerReviewSerializer
 
 
-def _get_course(request, user, course_id, depth=0):
+def _get_course(request, user, course_id, depth=0, load_content=False):
     """
     Utility method to obtain course components
     """
@@ -53,7 +53,7 @@ def _get_course(request, user, course_id, depth=0):
             course_descriptor = get_course(course_key, depth=depth)
         except ValueError:
             pass
-    if course_descriptor:
+    if course_descriptor and load_content:
         field_data_cache = FieldDataCache([course_descriptor], course_key, user)
         course_content = module_render.get_module(
             user,
@@ -64,7 +64,7 @@ def _get_course(request, user, course_id, depth=0):
     return course_descriptor, course_key, course_content
 
 
-def _get_course_child(request, user, course_key, content_id):
+def _get_course_child(request, user, course_key, content_id, load_content=False):
     """
     Return a course xmodule/xblock to the caller
     """
@@ -81,7 +81,7 @@ def _get_course_child(request, user, course_key, content_id):
     if content_key:
         store = modulestore()
         content_descriptor = store.get_item(content_key)
-    if content_descriptor:
+    if content_descriptor and load_content:
         field_data_cache = FieldDataCache([content_descriptor], course_key, user)
         content = module_render.get_module(
             user,
@@ -175,7 +175,21 @@ class WorkgroupsViewSet(viewsets.ModelViewSet):
             except ObjectDoesNotExist:
                 message = 'User {} does not exist'.format(user_id)
                 return Response({"detail": message}, status.HTTP_400_BAD_REQUEST)
+
             workgroup = self.get_object()
+
+            # Ensure the user is not already assigned to a workgroup for this project
+            existing_workgroups = Workgroup.objects.filter(users=user).filter(project=workgroup.project)
+            if len(existing_workgroups):
+                message = 'User {} already assigned to a workgroup for this project'.format(user_id)
+                return Response({"detail": message}, status.HTTP_400_BAD_REQUEST)
+
+            # Ensure the user is not already assigned to a project for this course
+            existing_projects = Project.objects.filter(course_id=workgroup.project.course_id).filter(workgroups__users__id=user.id)
+            if len(existing_projects):
+                message = 'User {} already assigned to a project for this course'.format(user_id)
+                return Response({"detail": message}, status.HTTP_400_BAD_REQUEST)
+
             workgroup.users.add(user)
             workgroup.save()
 
@@ -213,6 +227,9 @@ class WorkgroupsViewSet(viewsets.ModelViewSet):
         View Peer Reviews for a specific Workgroup
         """
         peer_reviews = WorkgroupPeerReview.objects.filter(workgroup=pk)
+        content_id = self.request.QUERY_PARAMS.get('content_id', None)
+        if content_id is not None:
+            peer_reviews = peer_reviews.filter(content_id=content_id)
         response_data = []
         if peer_reviews:
             for peer_review in peer_reviews:
@@ -226,6 +243,10 @@ class WorkgroupsViewSet(viewsets.ModelViewSet):
         View Workgroup Reviews for a specific Workgroup
         """
         workgroup_reviews = WorkgroupReview.objects.filter(workgroup=pk)
+        content_id = self.request.QUERY_PARAMS.get('content_id', None)
+        if content_id is not None:
+            workgroup_reviews = workgroup_reviews.filter(content_id=content_id)
+
         response_data = []
         if workgroup_reviews:
             for workgroup_review in workgroup_reviews:

@@ -5,11 +5,12 @@ import logging
 import itertools
 from lxml import etree
 from StringIO import StringIO
+from datetime import datetime
 
 from django.conf import settings
 from django.contrib.auth.models import Group, User
 from django.core.exceptions import ObjectDoesNotExist
-from django.db.models import Avg, Sum, Count
+from django.db.models import Avg, Sum, Count, Max
 from django.http import Http404
 from django.utils.translation import ugettext_lazy as _
 from django.db.models import Q
@@ -27,7 +28,7 @@ from student.roles import CourseRole, CourseAccessRole, CourseInstructorRole, Co
 
 from xmodule.modulestore.django import modulestore
 
-from api_manager.courseware_access import get_course, get_course_child
+from api_manager.courseware_access import get_course, get_course_child, get_course_leaf_nodes, get_course_key, course_exists, get_modulestore
 from api_manager.models import CourseGroupRelationship, CourseContentGroupRelationship, GroupProfile, \
     CourseModuleCompletion
 from api_manager.permissions import SecureAPIView, SecureListAPIView
@@ -35,7 +36,7 @@ from api_manager.users.serializers import UserSerializer, UserCountByCitySeriali
 from api_manager.utils import generate_base_uri
 from projects.models import Project, Workgroup
 from projects.serializers import ProjectSerializer, BasicWorkgroupSerializer
-from .serializers import CourseModuleCompletionSerializer
+from .serializers import CourseModuleCompletionSerializer, CourseSerializer
 from .serializers import GradeSerializer, CourseLeadersSerializer, CourseCompletionsLeadersSerializer
 
 from lms.lib.comment_client.user import get_course_social_stats
@@ -83,7 +84,7 @@ def _serialize_content(request, content_key, content_descriptor):
     protocol = 'http'
     if request.is_secure():
         protocol = protocol + 's'
-    content_uri = '{}://{}/api/courses/{}'.format(
+    content_uri = '{}://{}/api/server/courses/{}'.format(
         protocol,
         request.get_host(),
         unicode(content_key)
@@ -104,6 +105,11 @@ def _serialize_content(request, content_key, content_descriptor):
 
     data['start'] = getattr(content_descriptor, 'start', None)
     data['end'] = getattr(content_descriptor, 'end', None)
+    include_fields = request.QUERY_PARAMS.get('include_fields', None)
+    if include_fields:
+        include_fields = include_fields.split(',')
+        for field in include_fields:
+            data[field] = getattr(content_descriptor, field, None)
     return data
 
 
@@ -382,7 +388,7 @@ class CourseContentList(SecureAPIView):
         response_data = []
         content_type = request.QUERY_PARAMS.get('type', None)
         if course_id != content_id:
-            content_descriptor, content_key, content = get_course_child(request, request.user, course_key, content_id)  # pylint: disable=W0612
+            content_descriptor, content_key, content = get_course_child(request, request.user, course_key, content_id, load_content=True)  # pylint: disable=W0612
         else:
             content = course_descriptor
         if content:
@@ -455,13 +461,13 @@ class CourseContentDetail(SecureAPIView):
         response_data['uri'] = base_uri
         if course_id != content_id:
             element_name = 'children'
-            content_descriptor, content_key, content = get_course_child(request, request.user, course_key, content_id)  # pylint: disable=W0612
+            content_descriptor, content_key, content = get_course_child(request, request.user, course_key, content_id, load_content=True)  # pylint: disable=W0612
         else:
             element_name = 'content'
             protocol = 'http'
             if request.is_secure():
                 protocol = protocol + 's'
-            response_data['uri'] = '{}://{}/api/courses/{}'.format(
+            response_data['uri'] = '{}://{}/api/server/courses/{}'.format(
                 protocol,
                 request.get_host(),
                 unicode(course_key)
@@ -489,11 +495,11 @@ class CourseContentDetail(SecureAPIView):
         return Response(response_data, status=status.HTTP_200_OK)
 
 
-class CoursesList(SecureAPIView):
+class CoursesList(SecureListAPIView):
     """
     **Use Case**
 
-        CoursesList returns a collection of courses in the edX Platform. You can
+        CoursesList returns paginated list of courses in the edX Platform. You can
         use the uri value in the response to get details of the course.
 
     **Example Request**
@@ -516,22 +522,11 @@ class CoursesList(SecureAPIView):
 
         * id: The unique identifier for the course.
     """
+    serializer_class = CourseSerializer
 
-    def get(self, request):
-        """
-        GET /api/courses
-        """
-        response_data = []
-        store = modulestore()
-        course_descriptors = store.get_courses()
-        for course_descriptor in course_descriptors:
-            course_data = _serialize_content(
-                request,
-                course_descriptor.id,
-                course_descriptor
-            )
-            response_data.append(course_data)
-        return Response(response_data, status=status.HTTP_200_OK)
+    def get_queryset(self):
+        course_descriptors = get_modulestore().get_courses()
+        return course_descriptors
 
 
 class CoursesDetail(SecureAPIView):
@@ -589,7 +584,7 @@ class CoursesDetail(SecureAPIView):
         depth_int = int(depth)
         # get_course_by_id raises an Http404 if the requested course is invalid
         # Rather than catching it, we just let it bubble up
-        course_descriptor, course_key, course_content = get_course(request, request.user, course_id)  # pylint: disable=W0612
+        course_descriptor, course_key, course_content = get_course(request, request.user, course_id, depth=depth_int)  # pylint: disable=W0612
         if not course_descriptor:
             return Response({}, status=status.HTTP_404_NOT_FOUND)
         if depth_int > 0:
@@ -671,9 +666,9 @@ class CoursesGroupsList(SecureAPIView):
         response_data = {}
         group_id = request.DATA['group_id']
         base_uri = generate_base_uri(request)
-        course_descriptor, course_key, course_content = get_course(request, request.user, course_id)  # pylint: disable=W0612
-        if not course_descriptor:
+        if not course_exists(request, request.user, course_id):
             return Response({}, status=status.HTTP_404_NOT_FOUND)
+        course_key = get_course_key(course_id)
         try:
             existing_group = Group.objects.get(id=group_id)
         except ObjectDoesNotExist:
@@ -700,12 +695,11 @@ class CoursesGroupsList(SecureAPIView):
         """
         GET /api/courses/{course_id}/groups?type=workgroup
         """
-        course_descriptor, course_key, course_content = get_course(request, request.user, course_id)  # pylint: disable=W0612
-        if not course_descriptor:
+        if not course_exists(request, request.user, course_id):
             return Response({}, status=status.HTTP_404_NOT_FOUND)
         group_type = request.QUERY_PARAMS.get('type', None)
+        course_key = get_course_key(course_id)
         course_groups = CourseGroupRelationship.objects.filter(course_id=course_key)
-
         if group_type:
             course_groups = course_groups.filter(group__groupprofile__group_type=group_type)
         response_data = []
@@ -732,14 +726,14 @@ class CoursesGroupsDetail(SecureAPIView):
         """
         GET /api/courses/{course_id}/groups/{group_id}
         """
-        course_descriptor, course_key, course_content = get_course(request, request.user, course_id)  # pylint: disable=W0612
-        if not course_descriptor:
+        if not course_exists(request, request.user, course_id):
             return Response({}, status=status.HTTP_404_NOT_FOUND)
         try:
             existing_group = Group.objects.get(id=group_id)
         except ObjectDoesNotExist:
             return Response({}, status=status.HTTP_404_NOT_FOUND)
         try:
+            course_key = get_course_key(course_id)
             CourseGroupRelationship.objects.get(course_id=course_key, group=existing_group)
         except ObjectDoesNotExist:
             return Response({}, status=status.HTTP_404_NOT_FOUND)
@@ -754,11 +748,11 @@ class CoursesGroupsDetail(SecureAPIView):
         """
         DELETE /api/courses/{course_id}/groups/{group_id}
         """
-        course_descriptor, course_key, course_content = get_course(request, request.user, course_id)  # pylint: disable=W0612
-        if not course_descriptor:
+        if not course_exists(request, request.user, course_id):
             return Response({}, status=status.HTTP_204_NO_CONTENT)
         try:
             existing_group = Group.objects.get(id=group_id)
+            course_key = get_course_key(course_id)
             CourseGroupRelationship.objects.get(course_id=course_key, group=existing_group).delete()
         except ObjectDoesNotExist:
             pass
@@ -999,9 +993,9 @@ class CoursesUsersList(SecureAPIView):
         """
         POST /api/courses/{course_id}/users
         """
-        course_descriptor, course_key, course_content = get_course(request, request.user, course_id)  # pylint: disable=W0612
-        if not course_descriptor:
+        if not course_exists(request, request.user, course_id):
             return Response({}, status=status.HTTP_404_NOT_FOUND)
+        course_key = get_course_key(course_id)
         if 'user_id' in request.DATA:
             user_id = request.DATA['user_id']
             try:
@@ -1039,9 +1033,9 @@ class CoursesUsersList(SecureAPIView):
         response_data = OrderedDict()
         base_uri = generate_base_uri(request)
         response_data['uri'] = base_uri
-        course_descriptor, course_key, course_content = get_course(request, request.user, course_id)  # pylint: disable=W0612
-        if not course_descriptor:
+        if not course_exists(request, request.user, course_id):
             return Response({}, status=status.HTTP_404_NOT_FOUND)
+        course_key = get_course_key(course_id)
         # Get a list of all enrolled students
         users = CourseEnrollment.users_enrolled_in(course_key)
         upper_bound = getattr(settings, 'API_LOOKUP_UPPER_BOUND', 100)
@@ -1111,7 +1105,7 @@ class CoursesUsersDetail(SecureAPIView):
             user = User.objects.get(id=user_id, is_active=True)
         except ObjectDoesNotExist:
             return Response(response_data, status=status.HTTP_404_NOT_FOUND)
-        course_descriptor, course_key, course_content = get_course(request, user, course_id)
+        course_descriptor, course_key, course_content = get_course(request, user, course_id, load_content=True)
         if not course_descriptor:
             return Response(response_data, status=status.HTTP_404_NOT_FOUND)
         if CourseEnrollment.is_enrolled(user, course_key):
@@ -1129,9 +1123,9 @@ class CoursesUsersDetail(SecureAPIView):
             user = User.objects.get(id=user_id, is_active=True)
         except ObjectDoesNotExist:
             return Response({}, status=status.HTTP_204_NO_CONTENT)
-        course_descriptor, course_key, course_content = get_course(request, user, course_id)  # pylint: disable=W0612
-        if not course_descriptor:
+        if not course_exists(request, request.user, course_id):
             return Response({}, status=status.HTTP_404_NOT_FOUND)
+        course_key = get_course_key(course_id)
         CourseEnrollment.unenroll(user, course_key)
         response_data = {}
         base_uri = generate_base_uri(request)
@@ -1162,11 +1156,11 @@ class CourseContentGroupsList(SecureAPIView):
         """
         POST /api/courses/{course_id}/content/{content_id}/groups
         """
-        course_descriptor, course_key, course_content = get_course(request, request.user, course_id)  # pylint: disable=W0612
-        if not course_descriptor:
+        if not course_exists(request, request.user, course_id):
             return Response({}, status=status.HTTP_404_NOT_FOUND)
+        course_key = get_course_key(course_id)
         content_descriptor, content_key, existing_content = get_course_child(request, request.user, course_key, content_id)  # pylint: disable=W0612
-        if not existing_content:
+        if not content_descriptor:
             return Response({}, status=status.HTTP_404_NOT_FOUND)
         group_id = request.DATA.get('group_id')
         if group_id is None:
@@ -1179,12 +1173,12 @@ class CourseContentGroupsList(SecureAPIView):
         base_uri = generate_base_uri(request)
         response_data['uri'] = '{}/{}'.format(base_uri, existing_profile.group_id)
         response_data['course_id'] = unicode(course_key)
-        response_data['content_id'] = unicode(existing_content.scope_ids.usage_id)
+        response_data['content_id'] = unicode(content_key)
         response_data['group_id'] = str(existing_profile.group_id)
         try:
             CourseContentGroupRelationship.objects.get(
                 course_id=course_key,
-                content_id=existing_content.location,
+                content_id=content_key,
                 group_profile=existing_profile
             )
             response_data['message'] = "Relationship already exists."
@@ -1192,7 +1186,7 @@ class CourseContentGroupsList(SecureAPIView):
         except ObjectDoesNotExist:
             CourseContentGroupRelationship.objects.create(
                 course_id=course_key,
-                content_id=existing_content.location,
+                content_id=content_key,
                 group_profile=existing_profile
             )
             return Response(response_data, status=status.HTTP_201_CREATED)
@@ -1203,15 +1197,15 @@ class CourseContentGroupsList(SecureAPIView):
         """
         response_data = []
         group_type = request.QUERY_PARAMS.get('type')
-        course_descriptor, course_key, course_content = get_course(request, request.user, course_id)  # pylint: disable=W0612
-        if not course_descriptor:
+        if not course_exists(request, request.user, course_id):
             return Response({}, status=status.HTTP_404_NOT_FOUND)
+        course_key = get_course_key(course_id)
         content_descriptor, content_key, existing_content = get_course_child(request, request.user, course_key, content_id)  # pylint: disable=W0612
-        if not existing_content:
+        if not content_descriptor:
             return Response({}, status=status.HTTP_404_NOT_FOUND)
         relationships = CourseContentGroupRelationship.objects.filter(
             course_id=course_key,
-            content_id=existing_content.location,
+            content_id=content_key,
         ).select_related("groupprofile")
         if group_type:
             relationships = relationships.filter(group_profile__group_type=group_type)
@@ -1235,16 +1229,16 @@ class CourseContentGroupsDetail(SecureAPIView):
         """
         GET /api/courses/{course_id}/content/{content_id}/groups/{group_id}
         """
-        course_descriptor, course_key, course_content = get_course(request, request.user, course_id)  # pylint: disable=W0612
-        if not course_descriptor:
+        if not course_exists(request, request.user, course_id):
             return Response({}, status=status.HTTP_404_NOT_FOUND)
+        course_key = get_course_key(course_id)
         content_descriptor, content_key, existing_content = get_course_child(request, request.user, course_key, content_id)  # pylint: disable=W0612
-        if not existing_content:
+        if not content_descriptor:
             return Response({}, status=status.HTTP_404_NOT_FOUND)
         try:
             CourseContentGroupRelationship.objects.get(
                 course_id=course_key,
-                content_id=existing_content.location,
+                content_id=content_key,
                 group_profile__group_id=group_id
             )
         except ObjectDoesNotExist:
@@ -1276,17 +1270,17 @@ class CourseContentUsersList(SecureAPIView):
         """
         GET /api/courses/{course_id}/content/{content_id}/users
         """
-        course_descriptor, course_key, course_content = get_course(request, request.user, course_id)  # pylint: disable=W0612
-        if not course_descriptor:
+        if not course_exists(request, request.user, course_id):
             return Response({}, status=status.HTTP_404_NOT_FOUND)
+        course_key = get_course_key(course_id)
         content_descriptor, content_key, existing_content = get_course_child(request, request.user, course_key, content_id)  # pylint: disable=W0612
-        if not existing_content:
+        if not content_descriptor:
             return Response({}, status=status.HTTP_404_NOT_FOUND)
         enrolled = self.request.QUERY_PARAMS.get('enrolled', 'True')
         group_type = self.request.QUERY_PARAMS.get('type', None)
         group_id = self.request.QUERY_PARAMS.get('group_id', None)
         relationships = CourseContentGroupRelationship.objects.filter(
-            course_id=course_key, content_id=existing_content.location).select_related("groupprofile")
+            course_id=course_key, content_id=content_key).select_related("groupprofile")
 
         if group_id:
             relationships = relationships.filter(group_profile__group__id=group_id)
@@ -1356,9 +1350,9 @@ class CourseModuleCompletionList(SecureListAPIView):
         content_id = self.request.QUERY_PARAMS.get('content_id', None)
         stage = self.request.QUERY_PARAMS.get('stage', None)
         course_id = self.kwargs['course_id']
-        course_descriptor, course_key, course_content = get_course(self.request, self.request.user, course_id)  # pylint: disable=W0612
-        if not course_descriptor:
+        if not course_exists(self.request, self.request.user, course_id):
             raise Http404
+        course_key = get_course_key(course_id)
         queryset = CourseModuleCompletion.objects.filter(course_id=course_key)
         upper_bound = getattr(settings, 'API_LOOKUP_UPPER_BOUND', 100)
         if user_ids:
@@ -1367,9 +1361,9 @@ class CourseModuleCompletionList(SecureListAPIView):
 
         if content_id:
             content_descriptor, content_key, existing_content = get_course_child(self.request, self.request.user, course_key, content_id)  # pylint: disable=W0612
-            if not existing_content:
+            if not content_descriptor:
                 raise Http404
-            queryset = queryset.filter(content_id=existing_content.location)
+            queryset = queryset.filter(content_id=content_key)
 
         if stage:
             queryset = queryset.filter(stage=stage)
@@ -1387,16 +1381,16 @@ class CourseModuleCompletionList(SecureListAPIView):
             return Response({'message': _('content_id is missing')}, status.HTTP_400_BAD_REQUEST)
         if not user_id:
             return Response({'message': _('user_id is missing')}, status.HTTP_400_BAD_REQUEST)
-        course_descriptor, course_key, course_content = get_course(request, request.user, course_id)  # pylint: disable=W0612
-        if not course_descriptor:
+        if not course_exists(request, request.user, course_id):
             return Response({}, status=status.HTTP_404_NOT_FOUND)
+        course_key = get_course_key(course_id)
         content_descriptor, content_key, existing_content = get_course_child(request, request.user, course_key, content_id)  # pylint: disable=W0612
-        if not existing_content:
+        if not content_descriptor:
             return Response({'message': _('content_id is invalid')}, status.HTTP_400_BAD_REQUEST)
 
         completion, created = CourseModuleCompletion.objects.get_or_create(user_id=user_id,
                                                                            course_id=course_key,
-                                                                           content_id=existing_content.location,
+                                                                           content_id=content_key,
                                                                            stage=stage)
         serializer = CourseModuleCompletionSerializer(completion)
         if created:
@@ -1418,9 +1412,9 @@ class CoursesGradesList(SecureListAPIView):
         """
         GET /api/courses/{course_id}/grades?user_ids=1,2&content_ids=i4x://1/2/3,i4x://a/b/c
         """
-        course_descriptor, course_key, course_content = get_course(request, request.user, course_id)  # pylint: disable=W0612
-        if not course_descriptor:
+        if not course_exists(request, request.user, course_id):
             return Response({}, status=status.HTTP_404_NOT_FOUND)
+        course_key = get_course_key(course_id)
         queryset = StudentModule.objects.filter(
             course_id__exact=course_key,
             grade__isnull=False,
@@ -1437,9 +1431,9 @@ class CoursesGradesList(SecureListAPIView):
         content_id = self.request.QUERY_PARAMS.get('content_id', None)
         if content_id:
             content_descriptor, content_key, existing_content = get_course_child(request, request.user, course_key, content_id)  # pylint: disable=W0612
-            if not existing_content:
+            if not content_descriptor:
                 return Response({}, status=status.HTTP_400_BAD_REQUEST)
-            queryset = queryset.filter(module_state_key=existing_content.location)
+            queryset = queryset.filter(module_state_key=content_key)
 
         queryset_grade_avg = queryset.aggregate(Avg('grade'))
         queryset_grade_sum = queryset.aggregate(Sum('grade'))
@@ -1483,7 +1477,7 @@ class CoursesProjectList(SecureListAPIView):
 
     def get_queryset(self):
         course_id = self.kwargs['course_id']
-        course_descriptor, course_key, course_content = get_course(self.request, self.request.user, course_id)  # pylint: disable=W0612
+        course_key = get_course_key(course_id)
         return Project.objects.filter(course_id=course_key)
 
 
@@ -1500,9 +1494,9 @@ class CourseMetrics(SecureAPIView):
         """
         GET /api/courses/{course_id}/metrics/
         """
-        course_descriptor, course_key, course_content = get_course(request, request.user, course_id)  # pylint: disable=W0612
-        if not course_descriptor:
+        if not course_exists(request, request.user, course_id):
             return Response({}, status=status.HTTP_404_NOT_FOUND)
+        course_key = get_course_key(course_id)
         users_enrolled = CourseEnrollment.num_enrolled_in(course_key)
         data = {
             'users_enrolled': users_enrolled
@@ -1535,42 +1529,53 @@ class CoursesLeadersList(SecureListAPIView):
         count = self.request.QUERY_PARAMS.get('count', 3)
         data = {}
         course_avg = 0
-        course_descriptor, course_key, course_content = get_course(request, request.user, course_id)  # pylint: disable=W0612
-        if not course_descriptor:
+        if not course_exists(request, request.user, course_id):
             return Response({}, status=status.HTTP_404_NOT_FOUND)
-
+        course_key = get_course_key(course_id)
+        exclude_users = _get_aggregate_exclusion_user_ids(course_key)
         queryset = StudentModule.objects.filter(
             course_id__exact=course_key,
             grade__isnull=False,
             max_grade__isnull=False,
             max_grade__gt=0,
             student__is_active=True
-        ).exclude(student__in=_get_aggregate_exclusion_user_ids(course_key))
+        ).exclude(student__in=exclude_users)
 
         if content_id:
             content_descriptor, content_key, existing_content = get_course_child(request, request.user, course_key, content_id)  # pylint: disable=W0612
-            if not existing_content:
+            if not content_descriptor:
                 return Response({}, status=status.HTTP_400_BAD_REQUEST)
-            queryset = queryset.filter(module_state_key=existing_content.location)
+            queryset = queryset.filter(module_state_key=content_key)
 
         if user_id:
-            user_points = StudentModule.objects.filter(course_id__exact=course_key,
-                                                       student__id=user_id).aggregate(points=Sum('grade'))
+            user_queryset = StudentModule.objects.filter(course_id__exact=course_key, grade__isnull=False,
+                                                         max_grade__isnull=False,
+                                                         max_grade__gt=0,
+                                                         student__id=user_id)
+            user_points = user_queryset.aggregate(points=Sum('grade'))
             user_points = user_points['points'] or 0
-            users_above = queryset.values('student__id').annotate(points=Sum('grade')).\
-                filter(points__gt=user_points).count()
+            user_points = round(user_points, 2)
+            user_time_scored = user_queryset.aggregate(time_scored=Max('created'))
+            user_time_scored = user_time_scored['time_scored'] or datetime.now()
+            users_above = queryset.values('student__id').annotate(points=Sum('grade'))\
+                .annotate(time_scored=Max('created')).\
+                filter(Q(points__gt=user_points) | Q(points__gte=user_points, time_scored__lt=user_time_scored))\
+                .exclude(student__id=user_id).count()  # excluding user to overcome
+                #  float comparison bug
             data['position'] = users_above + 1
-            data['points'] = user_points
+            data['points'] = int(round(user_points))
 
         points = queryset.aggregate(total=Sum('grade'))
-        users = queryset.filter(student__is_active=True).aggregate(total=Count('student__id', distinct=True))
-        if users and users['total']:
-            course_avg = round(points['total'] / float(users['total']), 1)
+        if points and points['total'] is not None:
+            users_total = CourseEnrollment.users_enrolled_in(course_key).exclude(id__in=exclude_users).count()
+            if users_total:
+                course_avg = round(points['total'] / float(users_total), 1)
         data['course_avg'] = course_avg
         queryset = queryset.filter(student__is_active=True).values('student__id', 'student__username',
                                                                    'student__profile__title',
                                                                    'student__profile__avatar_url')\
-            .annotate(points_scored=Sum('grade')).order_by('-points_scored')[:count]
+            .annotate(points_scored=Sum('grade')).annotate(time_scored=Max('created'))\
+                       .order_by('-points_scored', 'time_scored')[:count]
         serializer = CourseLeadersSerializer(queryset, many=True)
 
         data['leaders'] = serializer.data  # pylint: disable=E1101
@@ -1601,34 +1606,46 @@ class CoursesCompletionsLeadersList(SecureAPIView):
         count = self.request.QUERY_PARAMS.get('count', 3)
         data = {}
         course_avg = 0
-        course_descriptor, course_key, course_content = get_course(request, request.user, course_id)  # pylint: disable=W0612
-        if not course_descriptor:
+        if not course_exists(request, request.user, course_id):
             return Response({}, status=status.HTTP_404_NOT_FOUND)
-
+        course_key = get_course_key(course_id)
+        detached_categories = ['discussion-course', 'group-project', 'discussion-forum']
+        total_possible_completions = len(get_course_leaf_nodes(course_key, detached_categories))
         exclude_users = _get_aggregate_exclusion_user_ids(course_key)
+        cat_list = [Q(content_id__contains=item.strip()) for item in detached_categories]
+        cat_list = reduce(lambda a, b: a | b, cat_list)
+
         queryset = CourseModuleCompletion.objects.filter(course_id=course_key)\
-            .exclude(user__in=exclude_users)
-
+            .exclude(user__in=exclude_users).exclude(cat_list)
+        total_actual_completions = queryset.filter(user__is_active=True).count()
         if user_id:
-            user_completions = queryset.filter(user__id=user_id).count()
+            user_queryset = CourseModuleCompletion.objects.filter(course_id=course_key, user__id=user_id)\
+                .exclude(cat_list)
+            user_completions = user_queryset.count()
+            user_time_completed = user_queryset.aggregate(time_completed=Max('created'))
+            user_time_completed = user_time_completed['time_completed'] or datetime.now()
             completions_above_user = queryset.filter(user__is_active=True).values('user__id')\
-                .annotate(completions=Count('content_id')).filter(completions__gt=user_completions).count()
+                .annotate(completions=Count('content_id')).annotate(time_completed=Max('created'))\
+                .filter(Q(completions__gt=user_completions) | Q(completions=user_completions,
+                                                                time_completed__lt=user_time_completed)).count()
             data['position'] = completions_above_user + 1
-            data['completions'] = user_completions
+            completion_percentage = 0
+            if total_possible_completions > 0:
+                completion_percentage = int(round(100 * user_completions/total_possible_completions))
+            data['completions'] = completion_percentage
 
-        total_completions = queryset.filter(user__is_active=True).count()
-        users = CourseModuleCompletion.objects.filter(user__is_active=True)\
-            .exclude(user__in=exclude_users)\
-            .aggregate(total=Count('user__id', distinct=True))
-
-        if users and users['total'] > 0:
-            course_avg = round(total_completions / float(users['total']), 1)
+        total_users = CourseEnrollment.users_enrolled_in(course_key).exclude(id__in=exclude_users).count()
+        if total_users and total_actual_completions:
+            course_avg = round(total_actual_completions / float(total_users), 1)
+            course_avg = int(round(100 * course_avg / total_possible_completions))  # avg in percentage
         data['course_avg'] = course_avg
 
         queryset = queryset.filter(user__is_active=True).values('user__id', 'user__username', 'user__profile__title',
                                                                 'user__profile__avatar_url')\
-            .annotate(completions=Count('content_id')).order_by('-completions')[:count]
-        serializer = CourseCompletionsLeadersSerializer(queryset, many=True)
+                       .annotate(completions=Count('content_id')).annotate(time_completed=Max('created'))\
+                       .order_by('-completions', 'time_completed')[:count]
+        serializer = CourseCompletionsLeadersSerializer(queryset, many=True,
+                                                        context={'total_completions': total_possible_completions})
         data['leaders'] = serializer.data  # pylint: disable=E1101
         return Response(data, status=status.HTTP_200_OK)
 
@@ -1645,8 +1662,7 @@ class CoursesWorkgroupsList(SecureListAPIView):
 
     def get_queryset(self):
         course_id = self.kwargs['course_id']
-        course_descriptor, course_key, course_content = get_course(self.request, self.request.user, course_id)  # pylint: disable=W0612
-        if not course_descriptor:
+        if not course_exists(self.request, self.request.user, course_id):
             raise Http404
 
         queryset = Workgroup.objects.filter(project__course_id=course_id)
@@ -1664,10 +1680,17 @@ class CoursesSocialMetrics(SecureListAPIView):
     def get(self, request, course_id): # pylint: disable=W0613
 
         try:
-            course_key = CourseKey.from_string(course_id)
+            # be robust to the try of course_id we get from caller
+            try:
+                # assume new style
+                course_key = CourseKey.from_string(course_id)
+                slash_course_id = course_key.to_deprecated_string()
+            except:
+                # assume course_id passed in is legacy format
+                slash_course_id = course_id
 
             # the forum service expects the legacy slash separated string format
-            data = get_course_social_stats(course_key.to_deprecated_string())
+            data = get_course_social_stats(slash_course_id)
 
             # remove any excluded users from the aggregate
 
@@ -1676,7 +1699,8 @@ class CoursesSocialMetrics(SecureListAPIView):
             for user_id in exclude_users:
                 if str(user_id) in data:
                     del data[str(user_id)]
-
+            total_enrollments = CourseEnrollment.users_enrolled_in(course_key).exclude(id__in=exclude_users).count()
+            data = {'total_enrollments': total_enrollments, 'users': data}
             http_status = status.HTTP_200_OK
         except CommentClientRequestError, e:
             data = {
@@ -1703,10 +1727,9 @@ class CoursesCitiesMetrics(SecureListAPIView):
         course_id = self.kwargs['course_id']
         city = self.request.QUERY_PARAMS.get('city', None)
         upper_bound = getattr(settings, 'API_LOOKUP_UPPER_BOUND', 100)
-        course_descriptor, course_key, course_content = get_course(self.request, self.request.user, course_id)  # pylint: disable=W0612
-        if not course_descriptor:
+        if not course_exists(self.request, self.request.user, course_id):
             raise Http404
-
+        course_key = get_course_key(course_id)
         exclude_users = _get_aggregate_exclusion_user_ids(course_key)
         queryset = CourseEnrollment.users_enrolled_in(course_key).exclude(id__in=exclude_users)
         if city:
@@ -1736,12 +1759,11 @@ class CoursesRolesList(SecureAPIView):
         GET /api/courses/{course_id}/roles/
         """
         course_id = self.kwargs['course_id']
-        course_descriptor, course_key, course_content = get_course(self.request, self.request.user, course_id)  # pylint: disable=W0612
-        if not course_descriptor:
+        if not course_exists(request, request.user, course_id):
             raise Http404
 
         response_data = []
-
+        course_key = get_course_key(course_id)
         instructors = CourseInstructorRole(course_key).users_with_role()
         for instructor in instructors:
             response_data.append({'id': instructor.id, 'role': 'instructor'})

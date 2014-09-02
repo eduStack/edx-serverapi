@@ -7,6 +7,7 @@ Run these tests @ Devstack:
 from datetime import datetime
 import json
 import uuid
+from urllib import urlencode
 
 from django.contrib.auth.models import Group, User
 from django.core.cache import cache
@@ -47,7 +48,11 @@ class WorkgroupsApiTests(TestCase):
 
     def setUp(self):
         self.test_server_prefix = 'https://testserver'
-        self.test_workgroups_uri = '/api/workgroups/'
+        self.test_workgroups_uri = '/api/server/workgroups/'
+        self.test_submissions_uri = '/api/server/submissions/'
+        self.test_peer_reviews_uri = '/api/server/peer_reviews/'
+        self.test_workgroup_reviews_uri = '/api/server/workgroup_reviews/'
+        self.test_courses_uri = '/api/server/courses'
         self.test_bogus_course_id = 'foo/bar/baz'
         self.test_bogus_course_content_id = "i4x://foo/bar/baz"
         self.test_group_id = '1'
@@ -84,6 +89,11 @@ class WorkgroupsApiTests(TestCase):
         self.test_project = Project.objects.create(
             course_id=self.test_course_id,
             content_id=self.test_course_content_id
+        )
+
+        self.test_project2 = Project.objects.create(
+            course_id=self.test_course_id,
+            content_id=unicode(self.test_group_project.scope_ids.usage_id)
         )
 
         self.test_user_email = str(uuid.uuid4())
@@ -270,6 +280,60 @@ class WorkgroupsApiTests(TestCase):
         self.assertIsNotNone(cohort)
         self.assertTrue(is_user_in_cohort(cohort, self.test_user.id, CourseUserGroup.WORKGROUP))
 
+
+    def test_workgroups_users_post_preexisting_workgroup(self):
+        data = {
+            'name': self.test_workgroup_name,
+            'project': self.test_project.id
+        }
+        response = self.do_post(self.test_workgroups_uri, data)
+        self.assertEqual(response.status_code, 201)
+        test_uri = '{}{}/'.format(self.test_workgroups_uri, str(response.data['id']))
+        users_uri = '{}users/'.format(test_uri)
+        data = {"id": self.test_user.id}
+        response = self.do_post(users_uri, data)
+        self.assertEqual(response.status_code, 201)
+        data = {
+            'name': "Workgroup 2",
+            'project': self.test_project.id
+        }
+        response = self.do_post(self.test_workgroups_uri, data)
+        self.assertEqual(response.status_code, 201)
+        test_uri = '{}{}/'.format(self.test_workgroups_uri, str(response.data['id']))
+        users_uri = '{}users/'.format(test_uri)
+        data = {"id": self.test_user.id}
+        response = self.do_post(users_uri, data)
+        self.assertEqual(response.status_code, 400)
+
+    def test_workgroups_users_post_preexisting_project(self):
+        data = {
+            'name': self.test_workgroup_name,
+            'project': self.test_project.id
+        }
+        response = self.do_post(self.test_workgroups_uri, data)
+        self.assertEqual(response.status_code, 201)
+        test_uri = '{}{}/'.format(self.test_workgroups_uri, str(response.data['id']))
+        users_uri = '{}users/'.format(test_uri)
+        data = {"id": self.test_user.id}
+        response = self.do_post(users_uri, data)
+        self.assertEqual(response.status_code, 201)
+
+        # Second project created in setUp, adding a new workgroup
+        data = {
+            'name': "Workgroup 2",
+            'project': self.test_project2.id
+        }
+        response = self.do_post(self.test_workgroups_uri, data)
+        self.assertEqual(response.status_code, 201)
+        test_uri = '{}{}/'.format(self.test_workgroups_uri, str(response.data['id']))
+        users_uri = '{}users/'.format(test_uri)
+
+        # Assign the test user to the alternate project/workgroup
+        data = {"id": self.test_user.id}
+        response = self.do_post(users_uri, data)
+        self.assertEqual(response.status_code, 400)
+
+
     def test_workgroups_users_post_with_cohort_backfill(self):
         """
         This test asserts a case where a workgroup was created before the existence of a cohorted discussion
@@ -381,17 +445,40 @@ class WorkgroupsApiTests(TestCase):
             'user': self.test_user.id,
             'reviewer': self.test_user.username,
             'question': 'Test question?',
-            'answer': 'Test answer!'
+            'answer': 'Test answer!',
+            'content_id': self.test_course_content_id
         }
-        response = self.do_post('/api/peer_reviews/', pr_data)
+        response = self.do_post(self.test_peer_reviews_uri, pr_data)
         self.assertEqual(response.status_code, 201)
-        pr_id = response.data['id']
+        pr1_id = response.data['id']
+        pr_data = {
+            'workgroup': workgroup_id,
+            'user': self.test_user.id,
+            'reviewer': self.test_user.username,
+            'question': 'Test question2',
+            'answer': 'Test answer2',
+            'content_id': self.test_course_id
+        }
+        response = self.do_post(self.test_peer_reviews_uri, pr_data)
+        self.assertEqual(response.status_code, 201)
+        pr2_id = response.data['id']
+
         test_uri = '{}{}/'.format(self.test_workgroups_uri, workgroup_id)
         peer_reviews_uri = '{}peer_reviews/'.format(test_uri)
         response = self.do_get(peer_reviews_uri)
         self.assertEqual(response.status_code, 200)
-        self.assertEqual(response.data[0]['id'], pr_id)
+        self.assertEqual(len(response.data), 2)
+        self.assertEqual(response.data[0]['id'], pr1_id)
         self.assertEqual(response.data[0]['reviewer'], self.test_user.username)
+
+        content_id = {"content_id": self.test_course_content_id}
+        test_uri = '{}{}/peer_reviews/?{}'.format(self.test_workgroups_uri, workgroup_id, urlencode(content_id))
+        response = self.do_get(test_uri)
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(response.data), 1)
+        self.assertEqual(response.data[0]['id'], pr1_id)
+        self.assertEqual(response.data[0]['reviewer'], self.test_user.username)
+
 
     def test_workgroups_workgroup_reviews_get(self):
         data = {
@@ -405,16 +492,36 @@ class WorkgroupsApiTests(TestCase):
             'workgroup': workgroup_id,
             'reviewer': self.test_user.username,
             'question': 'Test question?',
-            'answer': 'Test answer!'
+            'answer': 'Test answer!',
+            'content_id': self.test_course_content_id
         }
-        response = self.do_post('/api/workgroup_reviews/', wr_data)
+        response = self.do_post(self.test_workgroup_reviews_uri, wr_data)
         self.assertEqual(response.status_code, 201)
-        wr_id = response.data['id']
+        wr1_id = response.data['id']
+        wr_data = {
+            'workgroup': workgroup_id,
+            'reviewer': self.test_user.username,
+            'question': 'Test question?',
+            'answer': 'Test answer!',
+            'content_id': self.test_course_id
+        }
+        response = self.do_post(self.test_workgroup_reviews_uri, wr_data)
+        self.assertEqual(response.status_code, 201)
+
         test_uri = '{}{}/'.format(self.test_workgroups_uri, workgroup_id)
         workgroup_reviews_uri = '{}workgroup_reviews/'.format(test_uri)
         response = self.do_get(workgroup_reviews_uri)
         self.assertEqual(response.status_code, 200)
-        self.assertEqual(response.data[0]['id'], wr_id)
+        self.assertEqual(len(response.data), 2)
+        self.assertEqual(response.data[0]['id'], wr1_id)
+        self.assertEqual(response.data[0]['reviewer'], self.test_user.username)
+
+        content_id = {"content_id": self.test_course_content_id}
+        test_uri = '{}{}/workgroup_reviews/?{}'.format(self.test_workgroups_uri, workgroup_id, urlencode(content_id))
+        response = self.do_get(test_uri)
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(response.data), 1)
+        self.assertEqual(response.data[0]['id'], wr1_id)
         self.assertEqual(response.data[0]['reviewer'], self.test_user.username)
 
     def test_workgroups_submissions_get(self):
@@ -432,7 +539,7 @@ class WorkgroupsApiTests(TestCase):
             'document_url': 'https://s3.amazonaws.com/bucketname/filename.pdf',
             'document_mime_type': 'application/pdf'
         }
-        response = self.do_post('/api/submissions/', data)
+        response = self.do_post(self.test_submissions_uri, data)
         self.assertEqual(response.status_code, 201)
         submission_id = response.data['id']
         test_uri = '{}{}/'.format(self.test_workgroups_uri, workgroup_id)
@@ -469,7 +576,7 @@ class WorkgroupsApiTests(TestCase):
         self.assertEqual(response.status_code, 201)
 
         # Confirm the grades for the users
-        course_grades_uri = '/api/courses/{}/grades'.format(self.test_course_id)
+        course_grades_uri = '{}/{}/grades'.format(self.test_courses_uri, self.test_course_id)
         response = self.do_get(course_grades_uri)
         self.assertEqual(response.status_code, 200)
         self.assertGreater(len(response.data['grades']), 0)
@@ -615,7 +722,7 @@ class WorkgroupsApiTests(TestCase):
         self.assertEqual(response.status_code, 400)
 
     def test_workgroups_detail_get_undefined(self):
-        test_uri = '/api/workgroups/123456789/'
+        test_uri = '{}123456789/'.format(self.test_workgroups_uri)
         response = self.do_get(test_uri)
         self.assertEqual(response.status_code, 404)
 

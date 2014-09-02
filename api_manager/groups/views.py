@@ -14,13 +14,13 @@ from api_manager.models import GroupRelationship, CourseGroupRelationship, Group
 from api_manager.permissions import SecureAPIView, SecureListAPIView
 from api_manager.utils import str2bool, generate_base_uri
 from api_manager.organizations import serializers
-from projects.serializers import BasicWorkgroupSerializer
+from projects.serializers import BasicWorkgroupSerializer, GroupSerializer
 
 
 RELATIONSHIP_TYPES = {'hierarchical': 'h', 'graph': 'g'}
 
 
-class GroupsList(SecureAPIView):
+class GroupsList(SecureListAPIView):
     """
     ### The GroupsList view allows clients to retrieve/append a list of Group entities
     - URI: ```/api/groups/```
@@ -55,6 +55,7 @@ class GroupsList(SecureAPIView):
         ** organization: display_name, contact_name, phone, email
     * Ultimately, both 'type' and 'data' are determined by the client/caller.  Open edX has no type or data specifications at the present time.
     """
+    serializer_class = GroupSerializer
 
     def post(self, request):
         """
@@ -91,30 +92,23 @@ class GroupsList(SecureAPIView):
         response_status = status.HTTP_201_CREATED
         return Response(response_data, status=response_status)
 
-    def get(self, request):
+    def get(self, request, *args, **kwargs):
         """
-        GET /api/groups
+        if checks if get request has `type` filter
         """
-        response_data = []
         group_type = request.QUERY_PARAMS.get('type', None)
         if group_type is None:
             return Response({}, status=status.HTTP_400_BAD_REQUEST)
-        profiles = GroupProfile.objects.filter(group_type=request.GET['type']).select_related('group')
-        for profile in profiles:
-            item_data = {}
-            item_data['id'] = profile.group_id
-            if profile.name and len(profile.name):
-                group_name = profile.name
-            else:
-                group_name = profile.group.name
-            item_data['name'] = group_name
-            item_data['type'] = profile.group_type
-            if profile.data:
-                item_data['data'] = json.loads(profile.data)
-            item_data['uri'] = '{}/{}'.format(generate_base_uri(request, True), profile.group_id)
-            response_data.append(item_data)
-        return Response(response_data, status=status.HTTP_200_OK)
+        else:
+            return self.list(request, *args, **kwargs)
 
+    def get_queryset(self):
+        """
+        returns queryset filter by group type
+        """
+        group_type = self.request.QUERY_PARAMS.get('type', None)
+        groups = Group.objects.filter(groupprofile__group_type=group_type).select_related('group')
+        return groups
 
 class GroupsDetail(SecureAPIView):
     """
@@ -154,12 +148,18 @@ class GroupsDetail(SecureAPIView):
         except ObjectDoesNotExist:
             return Response({}, status.HTTP_404_NOT_FOUND)
         profile, _ = GroupProfile.objects.get_or_create(group_id=group_id)
+        group_name = request.DATA.get('name', None)
+        if group_name:
+            formatted_name = '{:04d}: {}'.format(existing_group.id, group_name)
+            existing_group.name = formatted_name
+            profile.name = group_name
         group_type = request.DATA.get('type', None)
         if group_type:
             profile.group_type = group_type
         data = request.DATA.get('data', None)
         if data:
             profile.data = json.dumps(data)
+        existing_group.save()
         profile.save()
         response_data['id'] = existing_group.id
         response_data['name'] = profile.name
@@ -203,6 +203,16 @@ class GroupsDetail(SecureAPIView):
         else:
             response_data['name'] = existing_group.name
         return Response(response_data, status=status.HTTP_200_OK)
+
+    def delete(self, request, group_id):  # pylint: disable=W0612,W0613
+        """
+        DELETE removes an existing group from the system
+        """
+        try:
+            existing_group = Group.objects.get(id=group_id).delete()
+        except ObjectDoesNotExist:
+            pass
+        return Response({}, status=status.HTTP_204_NO_CONTENT)
 
 
 class GroupsUsersList(SecureAPIView):
@@ -455,7 +465,10 @@ class GroupsGroupsDetail(SecureAPIView):
         response_status = status.HTTP_404_NOT_FOUND
         from_group_relationship = GroupRelationship.objects.get(group__id=group_id)
         if from_group_relationship:
-            to_group_relationship = GroupRelationship.objects.get(group__id=related_group_id)
+            try:
+                to_group_relationship = GroupRelationship.objects.get(group__id=related_group_id)
+            except ObjectDoesNotExist:
+                return Response(response_data, status=status.HTTP_404_NOT_FOUND)
             if to_group_relationship and str(to_group_relationship.parent_group_id) == str(group_id):
                 response_data['relationship_type'] = RELATIONSHIP_TYPES['hierarchical']
                 response_status = status.HTTP_200_OK
@@ -513,7 +526,7 @@ class GroupsCoursesList(SecureAPIView):
 
     def post(self, request, group_id):
         """
-        POST /api/groups/{group_id}/courses/{course_id}
+        POST /api/groups/{group_id}/courses/
         """
         response_data = {}
         try:

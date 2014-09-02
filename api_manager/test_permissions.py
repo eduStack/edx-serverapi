@@ -4,6 +4,7 @@ Run these tests @ Devstack:
 """
 from random import randint
 import uuid
+import mock
 
 from django.test import TestCase
 from django.test.utils import override_settings
@@ -12,6 +13,10 @@ TEST_API_KEY = "123456ABCDEF"
 
 
 @override_settings(API_ALLOWED_IP_ADDRESSES=['127.0.0.1', '10.0.2.2', '192.168.0.0/24'])
+@mock.patch.dict("django.conf.settings.FEATURES", {'ENFORCE_PASSWORD_POLICY': False,
+                                                   'ADVANCED_SECURITY': False,
+                                                   'PREVENT_CONCURRENT_LOGINS': False
+                                                   })
 class PermissionsTests(TestCase):
     """ Test suite for Permissions helper classes """
     def setUp(self):
@@ -20,7 +25,7 @@ class PermissionsTests(TestCase):
         self.username = self.username[3:-1]  # username is a 32-character field
         self.test_password = str(uuid.uuid4())
         self.test_email = str(uuid.uuid4()) + '@test.org'
-        self.test_uri = '/api/users'
+        self.test_uri = '/api/server/users'
         self.data = {'email': self.test_email, 'username': self.test_username, 'password': self.test_password}
         self.headers = {
             'Content-Type': 'application/json',

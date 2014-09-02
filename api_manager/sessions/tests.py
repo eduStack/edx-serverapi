@@ -7,6 +7,7 @@ Run these tests @ Devstack:
 """
 from random import randint
 import uuid
+import mock
 
 from django.contrib.auth.models import User
 from django.core.cache import cache
@@ -25,6 +26,10 @@ class SecureClient(Client):
 
 
 @override_settings(EDX_API_KEY=TEST_API_KEY)
+@mock.patch.dict("django.conf.settings.FEATURES", {'ENFORCE_PASSWORD_POLICY': False,
+                                                   'ADVANCED_SECURITY': False,
+                                                   'PREVENT_CONCURRENT_LOGINS': False
+                                                   })
 class SessionsApiTests(TestCase):
     """ Test suite for Sessions API views """
 
@@ -33,8 +38,8 @@ class SessionsApiTests(TestCase):
         self.test_username = str(uuid.uuid4())
         self.test_password = str(uuid.uuid4())
         self.test_email = str(uuid.uuid4()) + '@test.org'
-        self.base_users_uri = '/api/users'
-        self.base_sessions_uri = '/api/sessions'
+        self.base_users_uri = '/api/server/users'
+        self.base_sessions_uri = '/api/server/sessions'
 
         self.client = SecureClient()
         cache.clear()
@@ -146,3 +151,8 @@ class SessionsApiTests(TestCase):
         self.assertEqual(response.status_code, 204)
         response = self.do_get(test_uri)
         self.assertEqual(response.status_code, 404)
+
+    def test_session_detail_delete_invalid_session(self):
+        test_uri = self.base_sessions_uri + "214viouadblah124324blahblah"
+        response = self.do_delete(test_uri)
+        self.assertEqual(response.status_code, 204)

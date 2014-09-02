@@ -19,11 +19,13 @@ from courseware import grades, module_render
 from courseware.model_data import FieldDataCache
 from courseware.models import StudentModule
 from courseware.views import get_module_for_descriptor, save_child_position, get_current_child
-from django_comment_common.models import FORUM_ROLE_MODERATOR
+from django_comment_common.models import Role, FORUM_ROLE_MODERATOR
 from instructor.access import revoke_access, update_forum_role
 from lang_pref import LANGUAGE_KEY
+from notification_prefs.views import enable_notifications
 from lms.lib.comment_client.user import User as CommentUser
 from lms.lib.comment_client.utils import CommentClientRequestError
+from opaque_keys.edx.locations import SlashSeparatedCourseKey
 from student.models import CourseEnrollment, PasswordHistory, UserProfile
 from student.roles import CourseAccessRole, CourseInstructorRole, CourseObserverRole, CourseStaffRole, UserBasedRole
 from user_api.models import UserPreference
@@ -34,13 +36,20 @@ from util.password_policy_validators import (
 )
 
 from api_manager.courses.serializers import CourseModuleCompletionSerializer
-from api_manager.courseware_access import get_course, get_course_child, get_course_total_score
+from api_manager.courseware_access import get_course, get_course_child, get_course_total_score, get_course_key, course_exists
 from api_manager.permissions import SecureAPIView, SecureListAPIView, IdsInFilterBackend, HasOrgsFilterBackend
 from api_manager.models import GroupProfile, APIUser as User
 from api_manager.organizations.serializers import OrganizationSerializer
-from api_manager.utils import generate_base_uri
+from api_manager.utils import generate_base_uri, dict_has_items, extract_data_params
 from projects.serializers import BasicWorkgroupSerializer
 from .serializers import UserSerializer, UserCountByCitySerializer, UserRolesSerializer
+
+from opaque_keys import InvalidKeyError
+from opaque_keys.edx.keys import UsageKey, CourseKey
+from opaque_keys.edx.locations import Location
+from xmodule.modulestore import InvalidLocationError
+
+from xmodule.modulestore.django import modulestore
 
 log = logging.getLogger(__name__)
 AUDIT_LOG = logging.getLogger("audit")
@@ -83,15 +92,42 @@ def _save_content_position(request, user, course_key, position):
     parent_content_id = position['parent_content_id']
     child_content_id = position['child_content_id']
     if unicode(course_key) == parent_content_id:
-        parent_descriptor, parent_key, parent_content = get_course(request, user, parent_content_id)  # pylint: disable=W0612
+        parent_descriptor, parent_key, parent_content = get_course(request, user, parent_content_id, load_content=True)  # pylint: disable=W0612
     else:
-        parent_descriptor, parent_key, parent_content = get_course_child(request, user, course_key, parent_content_id)  # pylint: disable=W0612
-    child_descriptor, child_key, child_content = get_course_child(request, user, course_key, child_content_id)  # pylint: disable=W0612
-    if not child_descriptor:
+        parent_descriptor, parent_key, parent_content = get_course_child(request, user, course_key, parent_content_id, load_content=True)  # pylint: disable=W0612
+    if not parent_descriptor:
         return None
-    save_child_position(parent_content, child_content.location.name)
-    saved_content = get_current_child(parent_content)
-    return unicode(saved_content.scope_ids.usage_id)
+
+    # no need to fetch the actual child descriptor (avoid round trip to Mongo database), we just need
+    # the id
+    child_key = None
+    try:
+        child_key = UsageKey.from_string(child_content_id)
+    except InvalidKeyError:
+        try:
+            child_key = Location.from_deprecated_string(child_content_id)
+        except (InvalidLocationError, InvalidKeyError):
+            pass
+    if not child_key:
+        return None
+
+    # call an optimized version
+    _save_child_position(parent_content, child_key)
+
+    return child_content_id
+
+
+def _save_child_position(parent_descriptor, target_child_location):
+    """
+    Faster version than what is in the LMS since we don't need to load/traverse children descriptors,
+    we just compare id's from the array of children
+    """
+    for position, child_location in enumerate(parent_descriptor.children, start=1):
+        if child_location == target_child_location:
+            # Only save if position changed
+            if position != parent_descriptor.position:
+                parent_descriptor.position = position
+                parent_descriptor.save()
 
 
 def _manage_role(course_descriptor, user, role, action):
@@ -108,7 +144,16 @@ def _manage_role(course_descriptor, user, role, action):
             new_role = CourseAccessRole(user=user, role=role, course_id=course_descriptor.id, org=course_descriptor.org)
             new_role.save()
         if role in forum_moderator_roles:
-            update_forum_role(course_descriptor.id, user, FORUM_ROLE_MODERATOR, 'allow')
+            try:
+                dep_string = course_descriptor.id.to_deprecated_string()
+                ssck = SlashSeparatedCourseKey.from_deprecated_string(dep_string)
+                update_forum_role(ssck, user, FORUM_ROLE_MODERATOR, 'allow')
+            except Role.DoesNotExist:
+                try:
+                    update_forum_role(course_descriptor.id, user, FORUM_ROLE_MODERATOR, 'allow')
+                except Role.DoesNotExist:
+                    pass
+
     elif action is 'revoke':
         revoke_access(course_descriptor, user, role)
         if role in forum_moderator_roles:
@@ -121,7 +166,15 @@ def _manage_role(course_descriptor, user, role, action):
             queryset = user_instructor_courses | user_staff_courses
             queryset = queryset.filter(course_id=course_descriptor.id)
             if len(queryset) == 0:
-                update_forum_role(course_descriptor.id, user, FORUM_ROLE_MODERATOR, 'revoke')
+                try:
+                    dep_string = course_descriptor.id.to_deprecated_string()
+                    ssck = SlashSeparatedCourseKey.from_deprecated_string(dep_string)
+                    update_forum_role(ssck, user, FORUM_ROLE_MODERATOR, 'revoke')
+                except Role.DoesNotExist:
+                    try:
+                        update_forum_role(course_descriptor.id, user, FORUM_ROLE_MODERATOR, 'revoke')
+                    except Role.DoesNotExist:
+                        pass
 
 
 class UsersList(SecureListAPIView):
@@ -259,6 +312,8 @@ class UsersList(SecureListAPIView):
             user.is_staff = is_staff
         user.save()
 
+        # Be sure to always create a UserProfile record when adding users
+        # Bad things happen with the UserSerializer if one does not exist
         profile = UserProfile(user=user)
         profile.name = '{} {}'.format(first_name, last_name)
         profile.city = city
@@ -278,6 +333,9 @@ class UsersList(SecureListAPIView):
         profile.save()
 
         UserPreference.set_preference(user, LANGUAGE_KEY, get_language())
+
+        if settings.FEATURES.get('ENABLE_DISCUSSION_EMAIL_DIGEST'):
+            enable_notifications(user)
 
         # add this account creation to password history
         # NOTE, this will be a NOP unless the feature has been turned on in configuration
@@ -516,6 +574,9 @@ class UsersGroupsList(SecureAPIView):
     - URI: ```/api/users/{user_id}/groups/```
     - GET: Returns a JSON representation (array) of the set of related Group entities
         * type: Set filtering parameter
+        * course: Set filtering parameter to groups associated to a course or courses
+        - URI: ```/api/users/{user_id}/groups/?type=series,seriesX&course=slashes%3AMITx%2B999%2BTEST_COURSE```
+        * xblock_id: filters group data and returns those groups where xblock_id matches given xblock_id
     - POST: Append a Group entity to the set of related Group entities for the specified User
         * group_id: __required__, The identifier for the Group being added
     - POST Example:
@@ -563,12 +624,20 @@ class UsersGroupsList(SecureAPIView):
         except ObjectDoesNotExist:
             return Response({}, status=status.HTTP_404_NOT_FOUND)
         group_type = request.QUERY_PARAMS.get('type', None)
+        course = request.QUERY_PARAMS.get('course', None)
+        data_params = extract_data_params(request)
         response_data = {}
         base_uri = generate_base_uri(request)
         response_data['uri'] = base_uri
         groups = existing_user.groups.all()
         if group_type:
-            groups = groups.filter(groupprofile__group_type=group_type)
+            group_type = group_type.split(',')
+            groups = groups.filter(groupprofile__group_type__in=group_type)
+        if course:
+            course = course.split(',')
+            groups = groups.filter(coursegrouprelationship__course_id__in=course)
+        if data_params:
+            groups = [group for group in groups if dict_has_items(group.groupprofile.data, data_params)]
         response_data['groups'] = []
         for group in groups:
             group_profile = GroupProfile.objects.get(group_id=group.id)
@@ -685,6 +754,27 @@ class UsersCoursesList(SecureAPIView):
         return Response(response_data, status=status.HTTP_200_OK)
 
 
+def _get_current_position_loc(parent_module):
+    """
+    An optimized lookup for the current position. The LMS version can cause unnecessary round trips to
+    the Mongo database
+    """
+    if not hasattr(parent_module, 'position'):
+        return None
+
+    if not parent_module.children:
+        return None
+
+    index = 0
+    if parent_module.position:
+        index = parent_module.position - 1   # position is 1 indexed
+
+    if 0 <= index < len(parent_module.children):
+        return parent_module.children[index]
+
+    return parent_module.children[0]
+
+
 class UsersCoursesDetail(SecureAPIView):
     """
     ### The UsersCoursesDetail view allows clients to interact with a specific User-Course relationship (aka, enrollment)
@@ -722,24 +812,23 @@ class UsersCoursesDetail(SecureAPIView):
             user = User.objects.get(id=user_id, is_active=True)
         except ObjectDoesNotExist:
             return Response({}, status=status.HTTP_404_NOT_FOUND)
-        course_descriptor, course_key, course_content = get_course(request, user, course_id)  # pylint: disable=W0612
-        if not course_descriptor:
+        if not course_exists(request, user, course_id):
             return Response({}, status=status.HTTP_404_NOT_FOUND)
         response_data['user_id'] = user.id
         response_data['course_id'] = course_id
-        if request.DATA['position']:
-            content_position = _save_content_position(
-                request,
-                user,
-                course_key,
-                request.DATA['position']
-            )
-            if not content_position:
-                return Response(response_data, status=status.HTTP_400_BAD_REQUEST)
-            response_data['position'] = content_position
-
-
-
+        if request.DATA['positions']:
+            course_key = get_course_key(course_id)
+            response_data['positions'] = []
+            for position in request.DATA['positions']:
+                content_position = _save_content_position(
+                    request,
+                    user,
+                    course_key,
+                    position
+                )
+                if not content_position:
+                    return Response(response_data, status=status.HTTP_400_BAD_REQUEST)
+                response_data['positions'].append(content_position)
         return Response(response_data, status=status.HTTP_200_OK)
 
     def get(self, request, user_id, course_id):
@@ -750,7 +839,7 @@ class UsersCoursesDetail(SecureAPIView):
         base_uri = generate_base_uri(request)
         try:
             user = User.objects.get(id=user_id, is_active=True)
-            course_descriptor, course_key, course_content = get_course(request, user, course_id, depth=2)
+            course_descriptor, course_key, course_content = get_course(request, user, course_id)
         except (ObjectDoesNotExist, ValueError):
             return Response({}, status=status.HTTP_404_NOT_FOUND)
         if not CourseEnrollment.is_enrolled(user, course_key):
@@ -762,7 +851,7 @@ class UsersCoursesDetail(SecureAPIView):
             course_key,
             user,
             course_descriptor,
-            depth=2)
+            depth=0)
         course_module = module_render.get_module_for_descriptor(
             user,
             request,
@@ -773,17 +862,15 @@ class UsersCoursesDetail(SecureAPIView):
         response_data['position_tree'] = {}
         parent_module = course_module
         while parent_module is not None:
-            current_child_descriptor = get_current_child(parent_module)
-            if current_child_descriptor:
-                response_data['position_tree'][current_child_descriptor.category] = {}
-                response_data['position_tree'][current_child_descriptor.category]['id'] = unicode(current_child_descriptor.scope_ids.usage_id)
-                parent_module = module_render.get_module(
-                    user,
-                    request,
-                    current_child_descriptor.scope_ids.usage_id,
-                    field_data_cache,
-                    course_key
-                )
+
+            current_child_loc = _get_current_position_loc(parent_module)
+
+            if  current_child_loc:
+                response_data['position_tree'][current_child_loc.category] = {}
+                response_data['position_tree'][current_child_loc.category]['id'] = unicode(current_child_loc)
+
+                _,_,parent_module = get_course_child(request, user, course_key, unicode(current_child_loc), load_content=True)
+
             else:
                 parent_module = None
         return Response(response_data, status=status.HTTP_200_OK)
@@ -796,9 +883,9 @@ class UsersCoursesDetail(SecureAPIView):
             user = User.objects.get(id=user_id, is_active=True)
         except ObjectDoesNotExist:
             return Response({}, status=status.HTTP_204_NO_CONTENT)
-        course_descriptor, course_key, course_content = get_course(request, user, course_id)  # pylint: disable=W0612
-        if not course_descriptor:
+        if not course_exists(request, user, course_id):
             return Response({}, status=status.HTTP_204_NO_CONTENT)
+        course_key = get_course_key(course_id)
         CourseEnrollment.unenroll(user, course_key)
         return Response({}, status=status.HTTP_204_NO_CONTENT)
 
@@ -1073,7 +1160,17 @@ class UsersSocialMetrics(SecureListAPIView):
             return Response({}, status.HTTP_404_NOT_FOUND)
 
         comment_user = CommentUser.from_django_user(user)
-        comment_user.course_id = course_id
+
+        # be robust to the try of course_id we get from caller
+        try:
+            # assume new style
+            course_key = CourseKey.from_string(course_id)
+            slash_course_id = course_key.to_deprecated_string()
+        except:
+            # assume course_id passed in is legacy format
+            slash_course_id = course_id
+
+        comment_user.course_id = slash_course_id
 
         try:
             data = (comment_user.social_stats())[user_id]
@@ -1141,9 +1238,9 @@ class UsersRolesList(SecureListAPIView):
 
         course_id = self.request.QUERY_PARAMS.get('course_id', None)
         if course_id:
-            course_descriptor, course_key, course_content = get_course(self.request, user, course_id)  # pylint: disable=W0612
-            if not course_descriptor:
+            if not course_exists(self.request, user, course_id):
                 raise Http404
+            course_key = get_course_key(course_id)
             queryset = queryset.filter(course_id=course_key)
 
         role = self.request.QUERY_PARAMS.get('role', None)

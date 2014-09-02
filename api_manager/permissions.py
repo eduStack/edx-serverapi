@@ -88,13 +88,13 @@ class IdsInFilterBackend(filters.BaseFilterBackend):
     def filter_queryset(self, request, queryset, view):
         """
         Parse querystring to get ids and the filter the queryset
-        Max of 100 values are allowed for performance reasons
+        Max of 800 values are allowed for performance reasons
+        (800 satisfies a specific client integration use case)
         """
-        upper_bound = getattr(settings, 'API_LOOKUP_UPPER_BOUND', 100)
+        upper_bound = getattr(settings, 'API_LOOKUP_UPPER_BOUND', 800)
         ids = request.QUERY_PARAMS.get('ids')
         if ids:
-            if ',' in ids:
-                ids = ids.split(",")[:upper_bound]
+            ids = ids.split(",")[:upper_bound]
             return queryset.filter(id__in=ids)
         return queryset
 
